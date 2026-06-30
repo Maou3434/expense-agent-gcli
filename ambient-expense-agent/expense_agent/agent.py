@@ -15,6 +15,7 @@
 import base64
 import json
 import os
+import re
 
 import google.auth
 
@@ -56,6 +57,82 @@ class ExpenseReport(BaseModel):
     category: str = "Uncategorized"
     description: str = "No description provided"
     date: str = "Unknown"
+
+
+def luhn_checksum(card_number: str) -> bool:
+    """Validate a card number using Luhn's algorithm."""
+    digits = [int(c) for c in card_number if c.isdigit()]
+    if not (13 <= len(digits) <= 19):
+        return False
+    checksum = 0
+    reverse_digits = digits[::-1]
+    for i, digit in enumerate(reverse_digits):
+        if i % 2 == 1:
+            double = digit * 2
+            checksum += double if double < 10 else double - 9
+        else:
+            checksum += digit
+    return checksum % 10 == 0
+
+
+def scrub_pii(text: str) -> tuple[str, list[str]]:
+    """Scrubs SSNs and Credit Card numbers from the text."""
+    redacted_categories = []
+
+    # 1. Scrub Credit Cards
+    # Find potential credit card numbers (sequences of 13-19 digits, possibly separated by spaces or hyphens)
+    cc_pattern = re.compile(r'\b(?:\d[ -]*?){13,19}\b')
+
+    def cc_replacer(match):
+        val = match.group(0)
+        clean_val = re.sub(r'[^0-9]', '', val)
+        if luhn_checksum(clean_val):
+            if "Credit Card" not in redacted_categories:
+                redacted_categories.append("Credit Card")
+            return "[REDACTED CREDIT CARD]"
+        return val
+
+    text = cc_pattern.sub(cc_replacer, text)
+
+    # 2. Scrub SSNs
+    # Match standard SSN formats: XXX-XX-XXXX or 9 digits (XXXXXXXXX)
+    ssn_pattern = re.compile(r'\b\d{3}-\d{2}-\d{4}\b|\b\d{9}\b')
+
+    def ssn_replacer(match):
+        if "SSN" not in redacted_categories:
+            redacted_categories.append("SSN")
+        return "[REDACTED SSN]"
+
+    text = ssn_pattern.sub(ssn_replacer, text)
+
+    return text, redacted_categories
+
+
+def is_prompt_injection(text: str) -> bool:
+    """Detects potential prompt injection attempts in the text."""
+    text_lower = text.lower()
+    injection_patterns = [
+        r"ignore (?:all |previous )?(?:instructions|rules|guidelines|system|constraints|prompts)",
+        r"bypass (?:the )?(?:rules|security|restrictions|review|system)",
+        r"override (?:the )?(?:rules|system|instructions|guidelines)",
+        r"system prompt",
+        r"auto[- ]approve",
+        r"force[- ]approve",
+        r"force (?:the )?approval",
+        r"you must approve",
+        r"approve this expense",
+        r"approve the expense",
+        r"do not review",
+        r"skip (?:the )?(?:risk|review|assessment)",
+        r"ignore risk",
+        r"new instruction",
+        r"additional instruction",
+        r"instead of reviewing"
+    ]
+    for pattern in injection_patterns:
+        if re.search(pattern, text_lower):
+            return True
+    return False
 
 
 def extract_expense_data(text: str) -> dict:
@@ -134,13 +211,13 @@ async def parse_input(ctx: Context, node_input: types.Content) -> Event:
         )
     else:
         return Event(
-            actions=EventActions(route="risk_review"),
+            actions=EventActions(route="security_checkpoint"),
             output=expense.model_dump(),
             content=types.Content(
                 role="model",
                 parts=[
                     types.Part.from_text(
-                        text=f"Expense of ${expense.amount:.2f} by {expense.submitter} is equal to or over the threshold of ${THRESHOLD_USD:.2f}. Routing to LLM Risk Review."
+                        text=f"Expense of ${expense.amount:.2f} by {expense.submitter} is equal to or over the threshold of ${THRESHOLD_USD:.2f}. Routing to Security Checkpoint."
                     )
                 ],
             ),
@@ -159,6 +236,45 @@ async def auto_approve(ctx: Context, node_input: dict) -> Event:
     ctx.state["outcome"] = "Approved (Auto)"
     return Event(
         output={"status": "approved", "method": "auto"},
+        content=types.Content(role="model", parts=[types.Part.from_text(text=msg)]),
+    )
+
+
+async def security_checkpoint(ctx: Context, node_input: dict) -> Event:
+    """Scrubs PII and defends against prompt injection before LLM review."""
+    expense = ExpenseReport(**node_input)
+
+    # Scrub PII
+    clean_desc, redacted = scrub_pii(expense.description)
+    expense.description = clean_desc
+
+    # Update state with the scrubbed description and redacted categories
+    ctx.state["expense"] = expense.model_dump()
+    ctx.state["redacted_categories"] = redacted
+
+    # Check for prompt injection on the original description
+    original_desc = node_input.get("description", "")
+    if is_prompt_injection(original_desc):
+        ctx.state["security_event"] = True
+        msg = (
+            f"🚨 **Security Event Flagged**\n\n"
+            f"The expense submitted by **{expense.submitter}** was flagged for a potential prompt injection attempt "
+            f"in the description. It has been routed directly to human review, bypassing the LLM reviewer."
+        )
+        return Event(
+            actions=EventActions(route="human_approval"),
+            output=expense.model_dump(),
+            content=types.Content(role="model", parts=[types.Part.from_text(text=msg)]),
+        )
+
+    # If clean, route to risk_review
+    msg = f"🛡️ **Security Checkpoint Passed**\n\nNo prompt injection detected."
+    if redacted:
+        msg += f" Redacted: {', '.join(redacted)}."
+
+    return Event(
+        actions=EventActions(route="risk_review"),
+        output=expense.model_dump(),
         content=types.Content(role="model", parts=[types.Part.from_text(text=msg)]),
     )
 
@@ -206,11 +322,16 @@ async def risk_review(ctx: Context, node_input: dict) -> Event:
 
 async def human_approval(ctx: Context, node_input: dict):
     """Pauses the workflow for human approval and records the final outcome."""
+    is_security_event = ctx.state.get("security_event", False)
     # If we don't have the user's approval input yet, pause the workflow and request it
     if not ctx.resume_inputs or "approval" not in ctx.resume_inputs:
+        if is_security_event:
+            message = "🚨 **SECURITY EVENT DETECTED**: This expense has been flagged for a potential prompt injection. Please review and reply with 'approve' or 'reject' to make a decision."
+        else:
+            message = "Please review the risk assessment and reply with 'approve' or 'reject' to make a decision."
         yield RequestInput(
             interrupt_id="approval",
-            message="Please review the risk assessment and reply with 'approve' or 'reject' to make a decision.",
+            message=message,
         )
         return
 
@@ -245,7 +366,14 @@ root_agent = Workflow(
             parse_input,
             {
                 "auto_approve": auto_approve,
+                "security_checkpoint": security_checkpoint,
+            },
+        ),
+        (
+            security_checkpoint,
+            {
                 "risk_review": risk_review,
+                "human_approval": human_approval,
             },
         ),
         (risk_review, human_approval),
